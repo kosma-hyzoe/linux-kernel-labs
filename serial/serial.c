@@ -7,14 +7,28 @@
 #include <linux/pm_runtime.h>
 #include <linux/pm_runtime.h>
 #include <linux/iomap.h>
+#include <linux/miscdevice.h>
 
 
 /* Add your code here */
+static ssize_t serial_write(struct file *f, const char __user *buf,
+                         size_t sz, loff_t *off);
+static ssize_t serial_read(struct file *f, char __user *buf,
+                        size_t sz, loff_t *off);
+
+struct file_operations serial_fops = {
+        .write = serial_write,
+        .read = serial_read
+};
 
 struct serial_dev {
         /* TODO: more on iomem */
         void __iomem *regs;
+        struct miscdevice miscdev;
 };
+
+struct serial_fops;
+
 
 static u32 reg_read(struct serial_dev *serial, unsigned int reg)
 {
@@ -32,9 +46,23 @@ static void serial_write_char(struct serial_dev *serial, u32 c)
         reg_write(serial, c, UART_TX);
 }
 
+static ssize_t serial_write(struct file *f, const char __user *buf,
+                         size_t sz, loff_t *off)
+{
+        return -EINVAL;
+}
+
+static ssize_t serial_read(struct file *f, char __user *buf,
+                        size_t sz, loff_t *off)
+{
+        return 0;
+}
+
 static int serial_probe(struct platform_device *pdev)
 {
         struct serial_dev *serial;
+        struct resource *res;
+
         int ret;
         unsigned int baud_divisor, uartclk;
 
@@ -45,6 +73,11 @@ static int serial_probe(struct platform_device *pdev)
         serial->regs = devm_platform_ioremap_resource(pdev, 0);
         if (IS_ERR(serial->regs))
                 return PTR_ERR(serial->regs);
+
+        /* TODO: should it be later??? */
+        res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+        if (!res)
+                return -EINVAL;
 
         pm_runtime_enable(&pdev->dev);
         pm_runtime_get_sync(&pdev->dev);
@@ -68,8 +101,16 @@ static int serial_probe(struct platform_device *pdev)
 
         /* Clear UART FIFOs */
         reg_write(serial, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
+
+        serial->miscdev.minor = MISC_DYNAMIC_MINOR;
+        serial->miscdev.fops = &serial_fops;
+        serial->miscdev.parent = &pdev->dev;
+        serial->miscdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
+                                              "serial-%x", res->start);
+        misc_register(&serial->miscdev);
+        platform_set_drvdata(pdev, serial);
+
 	pr_info("Called %s\n", __func__);
-        serial_write_char(serial, 'f');
 
         return 0;
 
@@ -81,7 +122,12 @@ disable_rpm:
 
 static int serial_remove(struct platform_device *pdev)
 {
+        struct serial_dev *serial;
+
+        serial = platform_get_drvdata(pdev);
+
         pm_runtime_disable(&pdev->dev);
+        misc_deregister(pdev-
 	pr_info("Called %s\n", __func__);
         return 0;
 }
