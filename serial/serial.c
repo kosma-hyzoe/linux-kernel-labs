@@ -10,16 +10,21 @@
 #include <linux/iomap.h>
 #include <linux/miscdevice.h>
 
+#define SERIAL_RESET_COUNTER    0
+#define SERIAL_GET_COUNTER      1
 
 /* Add your code here */
 static ssize_t serial_write(struct file *f, const char __user *buf,
                          size_t sz, loff_t *off);
 static ssize_t serial_read(struct file *f, char __user *buf,
                         size_t sz, loff_t *off);
+static long serial_ioctl(struct file *file, unsigned int cmd,
+                               unsigned long arg);
 
 struct file_operations serial_fops = {
         .write = serial_write,
         .read = serial_read,
+        .unlocked_ioctl = serial_ioctl,
         /* so that the file is marked as used when written to */
         .owner = THIS_MODULE
 };
@@ -31,6 +36,32 @@ struct serial_dev {
         u32 counter;
 };
 
+
+static long serial_ioctl(struct file *file, unsigned int cmd,
+                               unsigned long arg)
+{
+        struct miscdevice *miscdev_ptr;
+        struct serial_dev *serial;
+        void __user *argp = (void __user *)arg;
+
+        /* ...it was set automatically! TODO: how? */
+        miscdev_ptr = file->private_data;
+        serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
+
+        switch (cmd) {
+                case SERIAL_GET_COUNTER:
+                        if (copy_to_user(argp, &serial->counter, sizeof(u32)))
+                                return -EFAULT;
+                        break;
+                case SERIAL_RESET_COUNTER:
+                        serial->counter = 0;
+                        break;
+                default:
+                        return -ENOTTY;
+        }
+        return 0;
+
+}
 
 static u32 reg_read(struct serial_dev *serial, unsigned int reg)
 {
