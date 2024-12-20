@@ -19,7 +19,9 @@ static ssize_t serial_read(struct file *f, char __user *buf,
 
 struct file_operations serial_fops = {
         .write = serial_write,
-        .read = serial_read
+        .read = serial_read,
+        /* so that the file is marked as used when written to */
+        .owner = THIS_MODULE
 };
 
 struct serial_dev {
@@ -57,9 +59,19 @@ static ssize_t serial_write(struct file *file, const char __user *buf,
         serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
 
 
-        for (i = 0; i < sz; i++)
-                ;
-        return -EINVAL;
+        for (i = 0; i < sz; i++) {
+                unsigned char c;
+                if (get_user(c, buf + i))
+                        return -EFAULT;
+
+                serial_write_char(serial, c);
+                // serial->counter++;
+
+                if (c == '\n')
+                        serial_write_char(serial, '\r');
+        }
+        off += sz;
+        return sz;
 }
 
 static ssize_t serial_read(struct file *f, char __user *buf,
