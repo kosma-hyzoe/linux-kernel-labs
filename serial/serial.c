@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -75,6 +76,7 @@ static int serial_probe(struct platform_device *pdev)
                 return PTR_ERR(serial->regs);
 
         /* TODO: should it be later??? */
+        /* retrieves phys address from DT */
         res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
         if (!res)
                 return -EINVAL;
@@ -108,6 +110,7 @@ static int serial_probe(struct platform_device *pdev)
         serial->miscdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
                                               "serial-%x", res->start);
         misc_register(&serial->miscdev);
+        /* so that we can get miscdev and other structs in other parts */
         platform_set_drvdata(pdev, serial);
 
 	pr_info("Called %s\n", __func__);
@@ -127,7 +130,7 @@ static int serial_remove(struct platform_device *pdev)
         serial = platform_get_drvdata(pdev);
 
         pm_runtime_disable(&pdev->dev);
-        misc_deregister(pdev-
+        misc_deregister(&serial->miscdev);
 	pr_info("Called %s\n", __func__);
         return 0;
 }
