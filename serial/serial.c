@@ -28,6 +28,7 @@ struct serial_dev {
         /* TODO: more on iomem */
         void __iomem *regs;
         struct miscdevice miscdev;
+        u32 counter;
 };
 
 
@@ -65,12 +66,12 @@ static ssize_t serial_write(struct file *file, const char __user *buf,
                         return -EFAULT;
 
                 serial_write_char(serial, c);
-                // serial->counter++;
+                serial->counter++;
 
                 if (c == '\n')
                         serial_write_char(serial, '\r');
         }
-        off += sz;
+        *off += sz;
         return sz;
 }
 
