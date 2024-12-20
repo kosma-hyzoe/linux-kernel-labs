@@ -28,8 +28,6 @@ struct serial_dev {
         struct miscdevice miscdev;
 };
 
-struct serial_fops;
-
 
 static u32 reg_read(struct serial_dev *serial, unsigned int reg)
 {
@@ -47,9 +45,20 @@ static void serial_write_char(struct serial_dev *serial, u32 c)
         reg_write(serial, c, UART_TX);
 }
 
-static ssize_t serial_write(struct file *f, const char __user *buf,
+static ssize_t serial_write(struct file *file, const char __user *buf,
                          size_t sz, loff_t *off)
 {
+        int i;
+        struct miscdevice *miscdev_ptr;
+        struct serial_dev *serial;
+
+        /* ...it was set automatically! TODO: how? */
+        miscdev_ptr = file->private_data;
+        serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
+
+
+        for (i = 0; i < sz; i++)
+                ;
         return -EINVAL;
 }
 
@@ -75,7 +84,6 @@ static int serial_probe(struct platform_device *pdev)
         if (IS_ERR(serial->regs))
                 return PTR_ERR(serial->regs);
 
-        /* TODO: should it be later??? */
         /* retrieves phys address from DT */
         res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
         if (!res)
