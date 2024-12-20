@@ -10,6 +10,7 @@
 #
 # Normal rules (sorted alphabetically)
 #
+compile_commands.json
 .*
 *.a
 *.asn1.[ch]
