@@ -9,6 +9,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/iomap.h>
 #include <linux/miscdevice.h>
+#include <linux/interrupt.h>
 
 #define SERIAL_RESET_COUNTER    0
 #define SERIAL_GET_COUNTER      1
@@ -112,14 +113,30 @@ static ssize_t serial_read(struct file *f, char __user *buf,
         return 0;
 }
 
+static irqreturn_t serial_irq_handler(int irq, void *arg)
+{
+        unsigned int c;
+        struct serial_dev *serial = arg;
+        if (!serial) {
+            pr_alert("serial_irq_handler: NULL serial pointer\n");
+            return IRQ_NONE;
+        }
+
+
+        c = reg_read(serial, UART_TX);
+        pr_alert("FOOBAR: %c!\n", c);
+        return IRQ_HANDLED;
+}
+
 static int serial_probe(struct platform_device *pdev)
 {
         struct serial_dev *serial;
         struct resource *res;
 
-        int ret;
+        int ret, irq;
         unsigned int baud_divisor, uartclk;
 
+        irq = platform_get_irq(pdev, 0);
         serial = devm_kzalloc(&pdev->dev, sizeof(*serial), GFP_KERNEL);
         if (!serial)
                 return -ENOMEM;
@@ -127,6 +144,7 @@ static int serial_probe(struct platform_device *pdev)
         serial->regs = devm_platform_ioremap_resource(pdev, 0);
         if (IS_ERR(serial->regs))
                 return PTR_ERR(serial->regs);
+
 
         /* retrieves phys address from DT */
         res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -153,6 +171,9 @@ static int serial_probe(struct platform_device *pdev)
         reg_write(serial, UART_LCR_WLEN8, UART_LCR);
         reg_write(serial, 0x00, UART_OMAP_MDR1);
 
+        /* enable interrupts */
+        reg_write(serial, UART_IER_RDI, UART_IER);
+
         /* Clear UART FIFOs */
         reg_write(serial, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 
@@ -162,8 +183,18 @@ static int serial_probe(struct platform_device *pdev)
         serial->miscdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
                                               "serial-%x", res->start);
         misc_register(&serial->miscdev);
+
+        ret = devm_request_irq(serial->miscdev.parent, irq, &serial_irq_handler,
+                         0, pdev->name, serial);
+        if (ret) {
+                /* TODO: what??? this is not needed??? */
+                // devm_free_irq(serial->miscdev.parent, irq, &serial);
+                goto disable_rpm;
+        }
+
         /* so that we can get miscdev and other structs in other parts */
         platform_set_drvdata(pdev, serial);
+
 
 	pr_info("Called %s\n", __func__);
 
