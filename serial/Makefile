@@ -1,3 +1,6 @@
+ARCH := arm
+CROSS_COMPILE := arm-linux-gnueabi-
+
 ifneq ($(KERNELRELEASE),)
 obj-m := serial.o
 else

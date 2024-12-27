@@ -13,6 +13,7 @@
 
 #define SERIAL_RESET_COUNTER    0
 #define SERIAL_GET_COUNTER      1
+#define SERIAL_BUFSIZE          16
 
 /* Add your code here */
 static ssize_t serial_write(struct file *f, const char __user *buf,
@@ -35,6 +36,10 @@ struct serial_dev {
         void __iomem *regs;
         struct miscdevice miscdev;
         u32 counter;
+        char rx_buf[SERIAL_BUFSIZE];
+        unsigned int buf_rd;
+        unsigned int buf_wr;
+        wait_queue_head_t wq;
 };
 
 
@@ -107,24 +112,45 @@ static ssize_t serial_write(struct file *file, const char __user *buf,
         return sz;
 }
 
-static ssize_t serial_read(struct file *f, char __user *buf,
+static ssize_t serial_read(struct file *file, char __user *buf,
                         size_t sz, loff_t *off)
 {
-        return 0;
+        /* NOTE: kinda misleading that we always read one char, not sz :/ */
+        int ret;
+        struct miscdevice *miscdev_ptr;
+        struct serial_dev *serial;
+
+        /* ...it was set automatically! TODO: how? */
+        miscdev_ptr = file->private_data;
+        serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
+
+        ret = wait_event_interruptible(serial->wq, serial->buf_wr !=
+                                       serial->buf_rd);
+        if (ret)
+                return ret;
+
+        ret = put_user(serial->rx_buf[serial->buf_rd++], buf);
+        if (serial->buf_rd == SERIAL_BUFSIZE)
+                serial->buf_rd = 0;
+        if (ret)
+                return ret;
+
+        *off += 1;
+        return 1;
 }
 
 static irqreturn_t serial_irq_handler(int irq, void *arg)
 {
         unsigned int c;
         struct serial_dev *serial = arg;
-        if (!serial) {
-            pr_alert("serial_irq_handler: NULL serial pointer\n");
+        if (!serial)
             return IRQ_NONE;
-        }
-
 
         c = reg_read(serial, UART_TX);
-        pr_alert("FOOBAR: %c!\n", c);
+        serial->rx_buf[serial->buf_wr++] = c;
+        if (serial->buf_wr == SERIAL_BUFSIZE)
+                serial->buf_wr = 0;
+        wake_up(&serial->wq);
         return IRQ_HANDLED;
 }
 
@@ -140,6 +166,8 @@ static int serial_probe(struct platform_device *pdev)
         serial = devm_kzalloc(&pdev->dev, sizeof(*serial), GFP_KERNEL);
         if (!serial)
                 return -ENOMEM;
+
+        init_waitqueue_head(&serial->wq);
 
         serial->regs = devm_platform_ioremap_resource(pdev, 0);
         if (IS_ERR(serial->regs))
