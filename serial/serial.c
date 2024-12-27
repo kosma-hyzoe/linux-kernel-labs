@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include "linux/spinlock_types.h"
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -40,6 +41,8 @@ struct serial_dev {
         unsigned int buf_rd;
         unsigned int buf_wr;
         wait_queue_head_t wq;
+        spinlock_t *lock;
+
 };
 
 
@@ -95,6 +98,7 @@ static ssize_t serial_write(struct file *file, const char __user *buf,
         /* ...it was set automatically! TODO: how? */
         miscdev_ptr = file->private_data;
         serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
+        spin_lock(serial->lock);
 
 
         for (i = 0; i < sz; i++) {
@@ -109,6 +113,7 @@ static ssize_t serial_write(struct file *file, const char __user *buf,
                         serial_write_char(serial, '\r');
         }
         *off += sz;
+        spin_unlock(serial->lock);
         return sz;
 }
 
@@ -123,6 +128,7 @@ static ssize_t serial_read(struct file *file, char __user *buf,
         /* ...it was set automatically! TODO: how? */
         miscdev_ptr = file->private_data;
         serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
+        spin_lock(serial->lock);
 
         ret = wait_event_interruptible(serial->wq, serial->buf_wr !=
                                        serial->buf_rd);
@@ -134,6 +140,7 @@ static ssize_t serial_read(struct file *file, char __user *buf,
                 serial->buf_rd = 0;
         if (ret)
                 return ret;
+        spin_unlock(serial->lock);
 
         *off += 1;
         return 1;
@@ -145,12 +152,14 @@ static irqreturn_t serial_irq_handler(int irq, void *arg)
         struct serial_dev *serial = arg;
         if (!serial)
             return IRQ_NONE;
+        spin_lock(serial->lock);
 
         c = reg_read(serial, UART_TX);
         serial->rx_buf[serial->buf_wr++] = c;
         if (serial->buf_wr == SERIAL_BUFSIZE)
                 serial->buf_wr = 0;
         wake_up(&serial->wq);
+        spin_unlock(serial->lock);
         return IRQ_HANDLED;
 }
 
@@ -168,6 +177,7 @@ static int serial_probe(struct platform_device *pdev)
                 return -ENOMEM;
 
         init_waitqueue_head(&serial->wq);
+        spin_lock_init(serial->lock);
 
         serial->regs = devm_platform_ioremap_resource(pdev, 0);
         if (IS_ERR(serial->regs))
