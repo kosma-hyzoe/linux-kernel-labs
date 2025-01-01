@@ -11,6 +11,7 @@
 #include <linux/iomap.h>
 #include <linux/miscdevice.h>
 #include <linux/interrupt.h>
+#include <linux/atomic.h>
 
 #define SERIAL_RESET_COUNTER    0
 #define SERIAL_GET_COUNTER      1
@@ -36,12 +37,12 @@ struct serial_dev {
         /* TODO: more on iomem */
         void __iomem *regs;
         struct miscdevice miscdev;
-        u32 counter;
+        atomic_t counter;
         char rx_buf[SERIAL_BUFSIZE];
         unsigned int buf_rd;
         unsigned int buf_wr;
         wait_queue_head_t wq;
-        spinlock_t *lock;
+        spinlock_t lock;
 
 };
 
@@ -51,7 +52,7 @@ static long serial_ioctl(struct file *file, unsigned int cmd,
 {
         struct miscdevice *miscdev_ptr;
         struct serial_dev *serial;
-        void __user *argp = (void __user *)arg;
+        unsigned int __user *argp = (unsigned int __user *)arg;
 
         /* ...it was set automatically! TODO: how? */
         miscdev_ptr = file->private_data;
@@ -59,11 +60,11 @@ static long serial_ioctl(struct file *file, unsigned int cmd,
 
         switch (cmd) {
                 case SERIAL_GET_COUNTER:
-                        if (copy_to_user(argp, &serial->counter, sizeof(u32)))
+                        if (put_user(atomic_read(&serial->counter), argp))
                                 return -EFAULT;
                         break;
                 case SERIAL_RESET_COUNTER:
-                        serial->counter = 0;
+                        atomic_set(&serial->counter, 0);
                         break;
                 default:
                         return -ENOTTY;
@@ -83,22 +84,29 @@ static void reg_write(struct serial_dev *serial, u32 val, unsigned int reg)
 
 static void serial_write_char(struct serial_dev *serial, u32 c)
 {
+        unsigned long flags;
+
+retry:
         while ((reg_read(serial, UART_LSR) & UART_LSR_THRE) == 0)
                 cpu_relax();
+
+        spin_lock_irqsave(&serial->lock, flags);
+        if ((reg_read(serial, UART_LSR) & UART_LSR_THRE) == 0) {
+                spin_unlock_irqrestore(&serial->lock, flags);
+                goto retry;
+        }
+
         reg_write(serial, c, UART_TX);
+        spin_unlock_irqrestore(&serial->lock, flags);
 }
 
 static ssize_t serial_write(struct file *file, const char __user *buf,
                          size_t sz, loff_t *off)
 {
         int i;
-        struct miscdevice *miscdev_ptr;
-        struct serial_dev *serial;
-
-        /* ...it was set automatically! TODO: how? */
-        miscdev_ptr = file->private_data;
-        serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
-        spin_lock(serial->lock);
+        struct miscdevice *miscdev_ptr = file->private_data;
+        struct serial_dev *serial = container_of(miscdev_ptr, struct
+                                                 serial_dev, miscdev);
 
 
         for (i = 0; i < sz; i++) {
@@ -107,40 +115,46 @@ static ssize_t serial_write(struct file *file, const char __user *buf,
                         return -EFAULT;
 
                 serial_write_char(serial, c);
-                serial->counter++;
+                atomic_inc(&serial->counter);
 
                 if (c == '\n')
                         serial_write_char(serial, '\r');
         }
         *off += sz;
-        spin_unlock(serial->lock);
         return sz;
 }
 
 static ssize_t serial_read(struct file *file, char __user *buf,
                         size_t sz, loff_t *off)
 {
-        /* NOTE: kinda misleading that we always read one char, not sz :/ */
         int ret;
+        unsigned char c;
         struct miscdevice *miscdev_ptr;
         struct serial_dev *serial;
 
-        /* ...it was set automatically! TODO: how? */
         miscdev_ptr = file->private_data;
         serial = container_of(miscdev_ptr, struct serial_dev, miscdev);
-        spin_lock(serial->lock);
 
-        ret = wait_event_interruptible(serial->wq, serial->buf_wr !=
-                                       serial->buf_rd);
+retry:
+        ret = wait_event_interruptible(serial->wq,
+                                       serial->buf_wr != serial->buf_rd);
         if (ret)
                 return ret;
 
-        ret = put_user(serial->rx_buf[serial->buf_rd++], buf);
+        spin_lock(&serial->lock);
+        if (serial->buf_wr == serial->buf_rd) {
+                spin_unlock(&serial->lock);
+                goto retry;
+        }
+        c = serial->rx_buf[serial->buf_rd++];
         if (serial->buf_rd == SERIAL_BUFSIZE)
                 serial->buf_rd = 0;
+
+        spin_unlock(&serial->lock);
+
+        ret = put_user(c, buf);
         if (ret)
                 return ret;
-        spin_unlock(serial->lock);
 
         *off += 1;
         return 1;
@@ -152,14 +166,17 @@ static irqreturn_t serial_irq_handler(int irq, void *arg)
         struct serial_dev *serial = arg;
         if (!serial)
             return IRQ_NONE;
-        spin_lock(serial->lock);
+        /* prevent preemption from a */
+        spin_lock(&serial->lock);
 
         c = reg_read(serial, UART_TX);
         serial->rx_buf[serial->buf_wr++] = c;
         if (serial->buf_wr == SERIAL_BUFSIZE)
                 serial->buf_wr = 0;
+
+        spin_unlock(&serial->lock);
         wake_up(&serial->wq);
-        spin_unlock(serial->lock);
+
         return IRQ_HANDLED;
 }
 
@@ -177,7 +194,7 @@ static int serial_probe(struct platform_device *pdev)
                 return -ENOMEM;
 
         init_waitqueue_head(&serial->wq);
-        spin_lock_init(serial->lock);
+        spin_lock_init(&serial->lock);
 
         serial->regs = devm_platform_ioremap_resource(pdev, 0);
         if (IS_ERR(serial->regs))
