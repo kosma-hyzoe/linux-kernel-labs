@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include "linux/dma-direction.h"
 #include "linux/spinlock_types.h"
 #include <linux/init.h>
 #include <linux/module.h>
@@ -12,6 +13,8 @@
 #include <linux/miscdevice.h>
 #include <linux/interrupt.h>
 #include <linux/atomic.h>
+#include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
 
 #define SERIAL_RESET_COUNTER    0
 #define SERIAL_GET_COUNTER      1
@@ -56,8 +59,46 @@ struct serial_dev {
         struct device *dev;
         spinlock_t lock;
 
+        dma_addr_t fifo_dma_addr;
+        struct dma_chan *txchan;
+
 };
 
+
+static int serial_init_dma(struct serial_dev *serial)
+{
+        int ret;
+        struct dma_slave_config txconf = {};
+        serial->fifo_dma_addr = dma_map_resource(serial->dev,
+                                                 serial->res->start
+                                                 + UART_TX * 4,
+                                                 4, DMA_TO_DEVICE, 0);
+        if (dma_mapping_error(serial->dev, serial->fifo_dma_addr))
+                return -ENOMEM;
+        txconf.direction = DMA_MEM_TO_DEV;
+        txconf.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
+        txconf.dst_addr = serial->fifo_dma_addr;
+        ret = dmaengine_slave_config(serial->txchan, &txconf);
+        if (ret)
+                return ret;
+        return 0;
+        // size_t sz = dma_opt_mapping_size(&pdev->dev);
+        // dma_alloc_coherent(pdev->dev, sz,
+}
+
+
+static int serial_clean_dma(struct serial_dev *serial)
+{
+        int ret;
+
+        ret = dmaengine_terminate_sync(serial->txchan);
+        if (ret)
+                return ret;
+        dma_unmap_resource(serial->dev, serial->fifo_dma_addr, 4, DMA_TO_DEVICE,
+                           0);
+        dma_release_channel(serial->txchan);
+        return 0;
+}
 
 static long serial_ioctl(struct file *file, unsigned int cmd,
                                unsigned long arg)
@@ -246,12 +287,19 @@ static int serial_probe(struct platform_device *pdev)
         /* Clear UART FIFOs */
         reg_write(serial, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 
+        ret = serial_init_dma(serial);
+        if (ret)
+                serial_clean_dma(serial);
+
+        misc_register(&serial->miscdev);
         serial->miscdev.minor = MISC_DYNAMIC_MINOR;
-        serial->miscdev.fops = &serial_fops_pio;
+        if (ret)
+                serial->miscdev.fops = &serial_fops_pio;
+        else
+                serial->miscdev.fops = &serial_fops_dma;
         serial->miscdev.parent = &pdev->dev;
         serial->miscdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
                                               "serial-%x", res->start);
-        misc_register(&serial->miscdev);
 
         ret = devm_request_irq(serial->miscdev.parent, irq, &serial_irq_handler,
                          0, pdev->name, serial);
@@ -263,7 +311,6 @@ static int serial_probe(struct platform_device *pdev)
 
         /* so that we can get miscdev and other structs in other parts */
         platform_set_drvdata(pdev, serial);
-
 
 	pr_info("Called %s\n", __func__);
 
@@ -282,6 +329,7 @@ static int serial_remove(struct platform_device *pdev)
         serial = platform_get_drvdata(pdev);
 
         pm_runtime_disable(&pdev->dev);
+        serial_clean_dma(serial);
         misc_deregister(&serial->miscdev);
 	pr_info("Called %s\n", __func__);
         return 0;
