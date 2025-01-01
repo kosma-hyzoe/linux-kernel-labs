@@ -18,18 +18,27 @@
 #define SERIAL_BUFSIZE          16
 
 /* Add your code here */
-static ssize_t serial_write(struct file *f, const char __user *buf,
+static ssize_t serial_write_pio(struct file *f, const char __user *buf,
+                         size_t sz, loff_t *off);
+static ssize_t serial_write_dma(struct file *f, const char __user *buf,
                          size_t sz, loff_t *off);
 static ssize_t serial_read(struct file *f, char __user *buf,
                         size_t sz, loff_t *off);
 static long serial_ioctl(struct file *file, unsigned int cmd,
                                unsigned long arg);
 
-struct file_operations serial_fops = {
-        .write = serial_write,
+struct file_operations serial_fops_pio = {
+        .write = serial_write_pio,
         .read = serial_read,
         .unlocked_ioctl = serial_ioctl,
         /* so that the file is marked as used when written to */
+        .owner = THIS_MODULE
+};
+
+struct file_operations serial_fops_dma = {
+        .write = serial_write_pio,
+        .read = serial_read,
+        .unlocked_ioctl = serial_ioctl,
         .owner = THIS_MODULE
 };
 
@@ -39,9 +48,12 @@ struct serial_dev {
         struct miscdevice miscdev;
         atomic_t counter;
         char rx_buf[SERIAL_BUFSIZE];
+        char tx_buf[SERIAL_BUFSIZE];
         unsigned int buf_rd;
         unsigned int buf_wr;
         wait_queue_head_t wq;
+        struct resource *res;
+        struct device *dev;
         spinlock_t lock;
 
 };
@@ -100,7 +112,7 @@ retry:
         spin_unlock_irqrestore(&serial->lock, flags);
 }
 
-static ssize_t serial_write(struct file *file, const char __user *buf,
+static ssize_t serial_write_pio(struct file *file, const char __user *buf,
                          size_t sz, loff_t *off)
 {
         int i;
@@ -205,6 +217,8 @@ static int serial_probe(struct platform_device *pdev)
         res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
         if (!res)
                 return -EINVAL;
+        serial->res = res;
+        serial->dev = &pdev->dev;
 
         pm_runtime_enable(&pdev->dev);
         pm_runtime_get_sync(&pdev->dev);
@@ -233,7 +247,7 @@ static int serial_probe(struct platform_device *pdev)
         reg_write(serial, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 
         serial->miscdev.minor = MISC_DYNAMIC_MINOR;
-        serial->miscdev.fops = &serial_fops;
+        serial->miscdev.fops = &serial_fops_pio;
         serial->miscdev.parent = &pdev->dev;
         serial->miscdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
                                               "serial-%x", res->start);
