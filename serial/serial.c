@@ -20,6 +20,9 @@
 #define SERIAL_GET_COUNTER      1
 #define SERIAL_BUFSIZE          16
 
+#define OMAP_UART_SCR_DMAMODE_CTL3 0x7
+#define OMAP_UART_SCR_TX_TRIG_GRANU1 BIT(6)
+
 /* Add your code here */
 static ssize_t serial_write_pio(struct file *f, const char __user *buf,
                          size_t sz, loff_t *off);
@@ -64,6 +67,32 @@ struct serial_dev {
 
 };
 
+static u32 reg_read(struct serial_dev *serial, unsigned int reg)
+{
+        return ioread32(serial->regs + (reg * 4));
+}
+static void reg_write(struct serial_dev *serial, u32 val, unsigned int reg)
+{
+        iowrite32(val, serial->regs + (reg * 4));
+}
+
+static void serial_write_char(struct serial_dev *serial, u32 c)
+{
+        unsigned long flags;
+
+retry:
+        while ((reg_read(serial, UART_LSR) & UART_LSR_THRE) == 0)
+                cpu_relax();
+
+        spin_lock_irqsave(&serial->lock, flags);
+        if ((reg_read(serial, UART_LSR) & UART_LSR_THRE) == 0) {
+                spin_unlock_irqrestore(&serial->lock, flags);
+                goto retry;
+        }
+
+        reg_write(serial, c, UART_TX);
+        spin_unlock_irqrestore(&serial->lock, flags);
+}
 
 static int serial_init_dma(struct serial_dev *serial)
 {
@@ -89,16 +118,20 @@ static int serial_init_dma(struct serial_dev *serial)
         ret = dmaengine_slave_config(serial->txchan, &txconf);
         if (ret)
                 return ret;
+        /* Enable DMA */
+
+        reg_write(serial, OMAP_UART_SCR_DMAMODE_CTL3 | OMAP_UART_SCR_TX_TRIG_GRANU1,
+        UART_OMAP_SCR);
         return 0;
         // size_t sz = dma_opt_mapping_size(&pdev->dev);
         // dma_alloc_coherent(pdev->dev, sz,
 }
 
-
 static void serial_clean_dma(struct serial_dev *serial)
 {
         if (serial->txchan) {
                 dmaengine_terminate_sync(serial->txchan);
+                /* map an address that's available to both CPU and device */
                 dma_unmap_resource(serial->dev, serial->fifo_dma_addr, 4,
                                    DMA_TO_DEVICE, 0);
                 dma_release_channel(serial->txchan);
@@ -131,32 +164,6 @@ static long serial_ioctl(struct file *file, unsigned int cmd,
 
 }
 
-static u32 reg_read(struct serial_dev *serial, unsigned int reg)
-{
-        return ioread32(serial->regs + (reg * 4));
-}
-static void reg_write(struct serial_dev *serial, u32 val, unsigned int reg)
-{
-        iowrite32(val, serial->regs + (reg * 4));
-}
-
-static void serial_write_char(struct serial_dev *serial, u32 c)
-{
-        unsigned long flags;
-
-retry:
-        while ((reg_read(serial, UART_LSR) & UART_LSR_THRE) == 0)
-                cpu_relax();
-
-        spin_lock_irqsave(&serial->lock, flags);
-        if ((reg_read(serial, UART_LSR) & UART_LSR_THRE) == 0) {
-                spin_unlock_irqrestore(&serial->lock, flags);
-                goto retry;
-        }
-
-        reg_write(serial, c, UART_TX);
-        spin_unlock_irqrestore(&serial->lock, flags);
-}
 
 static ssize_t serial_write_pio(struct file *file, const char __user *buf,
                          size_t sz, loff_t *off)
