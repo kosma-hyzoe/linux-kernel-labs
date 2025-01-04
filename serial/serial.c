@@ -69,6 +69,14 @@ static int serial_init_dma(struct serial_dev *serial)
 {
         int ret;
         struct dma_slave_config txconf = {};
+
+        serial->txchan = dma_request_chan(serial->dev, "tx");
+        if (IS_ERR(serial->txchan)) {
+		dev_warn(serial->dev, "No Tx channel (%pe)", serial->txchan);
+                ret = PTR_ERR(serial->txchan);
+                serial->txchan = NULL;
+                return ret;
+        }
         serial->fifo_dma_addr = dma_map_resource(serial->dev,
                                                  serial->res->start
                                                  + UART_TX * 4,
@@ -87,17 +95,14 @@ static int serial_init_dma(struct serial_dev *serial)
 }
 
 
-static int serial_clean_dma(struct serial_dev *serial)
+static void serial_clean_dma(struct serial_dev *serial)
 {
-        int ret;
-
-        ret = dmaengine_terminate_sync(serial->txchan);
-        if (ret)
-                return ret;
-        dma_unmap_resource(serial->dev, serial->fifo_dma_addr, 4, DMA_TO_DEVICE,
-                           0);
-        dma_release_channel(serial->txchan);
-        return 0;
+        if (serial->txchan) {
+                dmaengine_terminate_sync(serial->txchan);
+                dma_unmap_resource(serial->dev, serial->fifo_dma_addr, 4,
+                                   DMA_TO_DEVICE, 0);
+                dma_release_channel(serial->txchan);
+        }
 }
 
 static long serial_ioctl(struct file *file, unsigned int cmd,
@@ -236,7 +241,6 @@ static irqreturn_t serial_irq_handler(int irq, void *arg)
 static int serial_probe(struct platform_device *pdev)
 {
         struct serial_dev *serial;
-        struct resource *res;
 
         int ret, irq;
         unsigned int baud_divisor, uartclk;
@@ -245,6 +249,7 @@ static int serial_probe(struct platform_device *pdev)
         serial = devm_kzalloc(&pdev->dev, sizeof(*serial), GFP_KERNEL);
         if (!serial)
                 return -ENOMEM;
+        serial->dev = &pdev->dev;
 
         init_waitqueue_head(&serial->wq);
         spin_lock_init(&serial->lock);
@@ -255,11 +260,9 @@ static int serial_probe(struct platform_device *pdev)
 
 
         /* retrieves phys address from DT */
-        res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-        if (!res)
+        serial->res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+        if (!serial->res)
                 return -EINVAL;
-        serial->res = res;
-        serial->dev = &pdev->dev;
 
         pm_runtime_enable(&pdev->dev);
         pm_runtime_get_sync(&pdev->dev);
@@ -287,11 +290,15 @@ static int serial_probe(struct platform_device *pdev)
         /* Clear UART FIFOs */
         reg_write(serial, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 
-        ret = serial_init_dma(serial);
-        if (ret)
-                serial_clean_dma(serial);
+        /* so that we can get miscdev and other structs in other parts */
+        platform_set_drvdata(pdev, serial);
 
-        misc_register(&serial->miscdev);
+        ret = serial_init_dma(serial);
+        if (ret == -ENODEV)
+                serial_clean_dma(serial);
+        else if (ret)
+                goto disable_rpm;
+
         serial->miscdev.minor = MISC_DYNAMIC_MINOR;
         if (ret)
                 serial->miscdev.fops = &serial_fops_pio;
@@ -299,7 +306,8 @@ static int serial_probe(struct platform_device *pdev)
                 serial->miscdev.fops = &serial_fops_dma;
         serial->miscdev.parent = &pdev->dev;
         serial->miscdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
-                                              "serial-%x", res->start);
+                                              "serial-%x", serial->res->start);
+        misc_register(&serial->miscdev);
 
         ret = devm_request_irq(serial->miscdev.parent, irq, &serial_irq_handler,
                          0, pdev->name, serial);
@@ -309,8 +317,6 @@ static int serial_probe(struct platform_device *pdev)
                 goto disable_rpm;
         }
 
-        /* so that we can get miscdev and other structs in other parts */
-        platform_set_drvdata(pdev, serial);
 
 	pr_info("Called %s\n", __func__);
 
