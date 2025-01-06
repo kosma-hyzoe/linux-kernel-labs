@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include "asm-generic/errno.h"
 #include "linux/dma-direction.h"
 #include "linux/spinlock_types.h"
 #include <linux/init.h>
@@ -23,7 +24,6 @@
 #define OMAP_UART_SCR_DMAMODE_CTL3 0x7
 #define OMAP_UART_SCR_TX_TRIG_GRANU1 BIT(6)
 
-/* Add your code here */
 static ssize_t serial_write_pio(struct file *f, const char __user *buf,
                          size_t sz, loff_t *off);
 static ssize_t serial_write_dma(struct file *f, const char __user *buf,
@@ -42,7 +42,7 @@ struct file_operations serial_fops_pio = {
 };
 
 struct file_operations serial_fops_dma = {
-        .write = serial_write_pio,
+        .write = serial_write_dma,
         .read = serial_read,
         .unlocked_ioctl = serial_ioctl,
         .owner = THIS_MODULE
@@ -65,6 +65,9 @@ struct serial_dev {
         dma_addr_t fifo_dma_addr;
         struct dma_chan *txchan;
 
+        bool txongoing;
+        struct completion txcomplete;
+
 };
 
 static u32 reg_read(struct serial_dev *serial, unsigned int reg)
@@ -85,6 +88,7 @@ retry:
                 cpu_relax();
 
         spin_lock_irqsave(&serial->lock, flags);
+        /* TODO: ugh what did it do ? */
         if ((reg_read(serial, UART_LSR) & UART_LSR_THRE) == 0) {
                 spin_unlock_irqrestore(&serial->lock, flags);
                 goto retry;
@@ -98,6 +102,7 @@ static int serial_init_dma(struct serial_dev *serial)
 {
         int ret;
         struct dma_slave_config txconf = {};
+        init_completion(&serial->txcomplete);
 
         serial->txchan = dma_request_chan(serial->dev, "tx");
         if (IS_ERR(serial->txchan)) {
@@ -119,9 +124,8 @@ static int serial_init_dma(struct serial_dev *serial)
         if (ret)
                 return ret;
         /* Enable DMA */
-
-        reg_write(serial, OMAP_UART_SCR_DMAMODE_CTL3 | OMAP_UART_SCR_TX_TRIG_GRANU1,
-        UART_OMAP_SCR);
+        reg_write(serial, OMAP_UART_SCR_DMAMODE_CTL3 |
+                  OMAP_UART_SCR_TX_TRIG_GRANU1, UART_OMAP_SCR);
         return 0;
         // size_t sz = dma_opt_mapping_size(&pdev->dev);
         // dma_alloc_coherent(pdev->dev, sz,
@@ -137,6 +141,88 @@ static void serial_clean_dma(struct serial_dev *serial)
                 dma_release_channel(serial->txchan);
         }
 }
+
+static ssize_t serial_write_dma(struct file *f, const char __user *buf,
+                         size_t sz, loff_t *off)
+{
+        int ret;
+        unsigned int len;
+
+        unsigned long flags;
+        char first;
+
+        struct dma_async_tx_descriptor *desc;
+        dma_addr_t dma_addr;
+        dma_cookie_t cookie;
+
+        struct miscdevice *miscdev_ptr = f->private_data;
+        struct serial_dev *serial = container_of(miscdev_ptr,
+                                                 struct serial_dev, miscdev);
+
+        /* TODO: ...like that? */
+        if (serial->txchan == NULL)
+                return -EOPNOTSUPP;
+
+        /* prevent concurrent Tx */
+        spin_lock_irqsave(&serial->lock, flags);
+        if (serial->txongoing) {
+                spin_unlock_irqrestore(&serial->lock, flags);
+                return -EBUSY;
+        }
+        serial->txongoing = true;
+        spin_unlock_irqrestore(&serial->lock, flags);
+
+        len = min_t(unsigned int, sz, SERIAL_BUFSIZE);
+	ret = copy_from_user(serial->tx_buf, buf, len);
+	if (ret)
+		goto unlock_dma;
+
+        /* OMAP 8250 UART quirk: need to write the first byte manually */
+        first = serial->tx_buf[0];
+
+        dma_addr = dma_map_single(serial->dev, serial->tx_buf,
+                                  sz, DMA_TO_DEVICE);
+        if (dma_mapping_error(serial->dev, dma_addr)) {
+                ret = -ENOMEM;
+                goto unlock_dma;
+        }
+
+        desc = dmaengine_prep_slave_single(serial->txchan, dma_addr + 1,
+                sz - 1, DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+        if (!desc) {
+                ret = -EBUSY;
+                goto unmap_dma;
+        }
+
+        /* add operation to controller's pending queue */
+        cookie = dmaengine_submit(desc);
+        ret = dma_submit_error(cookie);
+        if (ret)
+                goto unmap_dma;
+
+        /* trigger next transfer */
+        dma_async_issue_pending(serial->txchan);
+
+	reg_write(serial, first, UART_TX);
+        ret = wait_for_completion_timeout(&serial->txcomplete,
+                                    msecs_to_jiffies(2000));
+        if (!ret) {
+                ret = -ETIMEDOUT;
+                goto cancel_dma;
+        }
+
+cancel_dma:
+        dmaengine_terminate_sync(serial->txchan);
+unmap_dma:
+        dma_unmap_single(serial->dev, dma_addr, sz, DMA_TO_DEVICE);
+unlock_dma:
+        spin_lock_irqsave(&serial->lock, flags);
+        serial->txongoing = false;
+        spin_unlock_irqrestore(&serial->lock, flags);
+
+        atomic_add(len, &serial->counter);
+	*off += len;
+	return len;}
 
 static long serial_ioctl(struct file *file, unsigned int cmd,
                                unsigned long arg)
@@ -262,8 +348,10 @@ static int serial_probe(struct platform_device *pdev)
         spin_lock_init(&serial->lock);
 
         serial->regs = devm_platform_ioremap_resource(pdev, 0);
-        if (IS_ERR(serial->regs))
+        if (IS_ERR(serial->regs)) {
+		dev_warn(serial->dev, "No Tx channel (%pe)", serial->txchan);
                 return PTR_ERR(serial->regs);
+        }
 
 
         /* retrieves phys address from DT */
