@@ -27,8 +27,9 @@ static void reg_write(struct serial_dev *serial, u32 val, unsigned int reg)
 
 static void serial_write_char(struct serial_dev *serial, u32 c)
 {
+        // while UART LSR Transmit Holding Register is Empty
         while ((reg_read(serial, UART_LSR) & UART_LSR_THRE) == 0)
-                cpu_relax();
+                cpu_relax(); //uses wait/PAUSE inst., arch specific
         reg_write(serial, c, UART_TX);
 }
 
@@ -42,6 +43,7 @@ static int serial_probe(struct platform_device *pdev)
         if (!serial)
                 return -ENOMEM;
 
+        // map the io region
         serial->regs = devm_platform_ioremap_resource(pdev, 0);
         if (IS_ERR(serial->regs))
                 return PTR_ERR(serial->regs);
