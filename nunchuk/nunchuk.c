@@ -85,15 +85,11 @@ static void nunchuk_remove(struct i2c_client *client)
 	return;
 }
 
-// static const struct i2c_device_id nunchuk_device_id[] = {
-// 	{ "nintendo,nunchuk" },
-// 	{ }
-// };
-
 static const struct of_device_id nunchuk_dt_match[] = {
 	{ .compatible = "nintendo,nunchuk" },
 	{ },
 };
+// creates an alias for loading the module if specified in DT
 MODULE_DEVICE_TABLE(of, nunchuk_dt_match);
 
 static struct i2c_driver nunchuk_driver = {
