@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
+#include "linux/container_of.h"
 #include <linux/init.h>
+#include <linux/input.h>
 #include <linux/module.h>
 #include <linux/i2c.h>
 #include <linux/delay.h>
@@ -39,15 +41,64 @@ static int _nunchuk_read_regs(struct i2c_client *client, char *rx_buf)
 	return 0;
 }
 
-static int nunchuk_probe(struct i2c_client *client)
+void nunchuk_poll(struct input_dev *input)
 {
-	int ret, zpressed, cpressed;
-	const char tx_buf1[2] = INIT_BYTES_1;
-	const char tx_buf2[2] = INIT_BYTES_2;
+	int zpressed= 0, cpressed = 0;
+	struct nunchuk_dev *nunchuk = input_get_drvdata(input);
+	struct i2c_client *client = nunchuk->i2c_client;
 	u8 recv[6];
 
+
+	if (_nunchuk_read_regs(client, recv) < 0)
+		return;
+
+	zpressed = (recv[5] & BIT(0)) ? 0 : 1;
+	cpressed = (recv[5] & BIT(1)) ? 0 : 1;
+
+	input_report_key(input, BTN_Z, zpressed);
+	input_report_key(input, BTN_C, cpressed);
+	input_sync(input);
+}
+
+static int nunchuk_probe(struct i2c_client *client)
+{
+	int ret;
+	const char tx_buf1[2] = INIT_BYTES_1;
+	const char tx_buf2[2] = INIT_BYTES_2;
+	struct input_dev *input;
+	struct nunchuk_dev *nunchuk;
+	u8 recv[6];
+
+	nunchuk = devm_kzalloc(&client->dev, sizeof(*nunchuk), GFP_KERNEL);
+	if (!nunchuk)
+		return -ENOMEM;
+
+	// pointer magic :p
+	nunchuk->i2c_client = client;
+
+	input = devm_input_allocate_device(&client->dev);
+	if (!input)
+		return -ENOMEM;
+	input_set_drvdata(input, nunchuk);
+
+	input->name = "Wii Nunchuk";
+	input->id.bustype = BUS_I2C;
+	set_bit(EV_KEY, input->evbit);
+	set_bit(BTN_C, input->keybit);
+	set_bit(BTN_Z, input->keybit);
+	input_setup_polling(input, nunchuk_poll);
+	input_set_poll_interval(input, 50);
+	// NOTE: call last
+	ret = input_register_device(input);
+	if (ret) {
+		dev_err(&client->dev, "failed to register input device (%d)\n",
+			ret);
+		return ret;
+	}
+
+	// initialize the device
 	ret = i2c_master_send(client, tx_buf1, sizeof(tx_buf1));
-	if (ret != 2) {
+	if (ret < 0) {
 		pr_alert("%s: error %d while sending bytes", __func__, ret);
 		return ret;
 	}
@@ -68,14 +119,6 @@ static int nunchuk_probe(struct i2c_client *client)
 	ret = _nunchuk_read_regs(client, recv);
 	if (ret < 0)
 		return ret;
-
-	zpressed = (recv[5] & BIT(0)) ? 0 : 1;
-	if (zpressed)
-		dev_info(&client->dev, "Z button pressed\n");
-
-	cpressed = (recv[5] & BIT(1)) ? 0 : 1;
-	if (cpressed)
-		dev_info(&client->dev, "C button pressed\n");
 
 	return 0;
 }
